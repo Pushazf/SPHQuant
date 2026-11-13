@@ -1,0 +1,10 @@
+# Calibration, export and the throughput test (Python 3.12, CUDA 13 wheels of torch).
+# scripts/benchmark.sh installs SGLang 0.5.23, which pins the same torch and transformers.
+torch==2.14.1
+transformers==5.19.0
+huggingface_hub
+safetensors
+numpy
+pillow
+pyarrow
+httpx
