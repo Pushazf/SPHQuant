@@ -40,9 +40,9 @@ SPHQuant achieves competitive accuracy across three recent VLMs at extreme low b
 </details>
 
 <details open>
-<summary><strong>Reproduction with this repository</strong></summary>
+<summary><strong>Qwen3.5-9B with this repository</strong></summary>
 
-Qwen3.5-9B quantized with `scripts/calibrate_w2.sh` (default settings) and evaluated with `scripts/benchmark.sh --limit 100` on one NVIDIA B300: the same 100 seeded questions per dataset for both weights, thinking off, greedy decoding.
+Qwen3.5-9B quantized with `scripts/calibrate_w2.sh` (default settings) and evaluated with `scripts/benchmark.sh --limit 100`: the same 100 seeded questions per dataset for both weights, thinking off, greedy decoding.
 
 | Qwen3.5-9B | RealWorldQA | ScienceQA | TextVQA |
 |---|---|---|---|
@@ -55,89 +55,24 @@ Prompts and answer parsing differ from the harness behind the paper's table, and
 
 ## ⚙️ Requirements
 
-- Linux with one NVIDIA GPU and a CUDA 13 driver. Our runs used one NVIDIA B300; peak GPU memory during calibration was 44 GB.
-- Python 3.12, `curl`, and about 80 GB of free disk for the model, COCO, the calibration cache and the exported checkpoints.
-- The CUDA 13 toolkit (`nvcc`) for the decode-throughput test, which builds its kernels.
+- Linux with one NVIDIA GPU, a CUDA 13 driver and Python 3.12.
+- The CUDA 13 toolkit (`nvcc`) for the decode-throughput test. Each script installs its Python dependencies into `.venv`.
 
-The scripts create a virtual environment in `.venv` (change it with `--venv`). Calibration and the throughput test install `requirements.txt` (PyTorch 2.14.1, Transformers 5.19.0); the benchmark adds SGLang 0.5.23, which pins the same versions, so all three share one environment.
-
-## 🔧 W2 Calibration
-
-One command quantizes the text decoder of [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B) to W2 (8D vectors: 8 sign bits, a 6-bit index into a 64-entry direction codebook and a 4-bit radius, 2.25 bits per weight):
+## 🔧 Reproduction
 
 ```bash
+# 1. W2 calibration of Qwen3.5-9B (downloads the model and COCO; rerun to resume)
 bash scripts/calibrate_w2.sh --work-dir /path/to/work
-```
 
-| Step | Output in `--work-dir` | Time on one B300 |
-|---|---|---|
-| 1. Environment from `requirements.txt` | `.venv` in the repository | a few minutes |
-| 2. Qwen3.5-9B (pinned revision) and COCO val2017 images and captions | `models/Qwen3.5-9B`, `data/coco` | depends on the network (~21 GB) |
-| 3. Calibration cache: 4,096 training and 128 validation COCO samples | `calib-cache` (~10 GB) | ~5 min |
-| 4. Layer-wise calibration of all 32 decoder layers, 20 epochs each | `calib-w2` | ~10.5 h |
-| 5. Export | `w2-dense` (decoded BF16 checkpoint for the benchmark), `w2-packed` (packed W2 weights, 2.5 bits per weight) | ~1 min |
-
-Running the script again resumes: finished steps are skipped and an interrupted calibration continues from its last finished layer. Options: `--layers A-B` (default `0-31`), `--epochs N` (default `20`), `--venv DIR`, `--python PATH`; see `bash scripts/calibrate_w2.sh --help`.
-
-## 📊 Benchmark
-
-The benchmark serves a model with SGLang's own server (`python -m sglang.launch_server`) and scores the answers with the client in `benchmark/`. `scripts/benchmark.sh` installs SGLang, downloads every dataset at a pinned revision (checking its sha256), starts and stops the server, runs the evaluation, and writes a summary per dataset.
-
-```bash
-# BF16 baseline (the model downloaded by calibrate_w2.sh)
+# 2. RealWorldQA, ScienceQA and TextVQA: BF16 baseline and SPHQuant W2
 bash scripts/benchmark.sh --model /path/to/work/models/Qwen3.5-9B --weights-id bf16
-# SPHQuant W2, decoded to BF16
 bash scripts/benchmark.sh --model /path/to/work/w2-dense --weights-id w2
-```
 
-Both runs write to `outputs/eval/<dataset>/`:
-
-- `<weights-id>_think-<off|on>.jsonl`: one record per question (the model's output, the extracted answer, its score, truncation and repetition-loop flags). A rerun resumes from these files.
-- `summary.md`: accuracy, truncation, loops and unparsable answers per weights id, plus the paired difference to `bf16` with a bootstrap 95% confidence interval.
-
-| Dataset (`--datasets` name) | Source | Questions | Metric |
-|---|---|---|---|
-| RealWorldQA (`realworldqa`) | `xai-org/RealworldQA`, test | 765 | accuracy (multiple choice and short answers) |
-| ScienceQA (`scienceqa`) | `lmms-lab-encoder/ScienceQA`, ScienceQA-IMG test | 2,017 | accuracy |
-| TextVQA (`textvqa`) | `lmms-lab-encoder/textvqa`, validation | 5,000 | VQA accuracy |
-
-As in the paper, thinking is off and generation is greedy (temperature 0), with at most 2,048 output tokens. Answers are parsed by rules; there is no LLM judge and no random fallback, so an unparsable answer counts as wrong.
-
-Useful options (`bash scripts/benchmark.sh --help` lists all):
-
-- `--datasets realworldqa,scienceqa` evaluates only some datasets.
-- `--limit 100` evaluates a seeded subset per dataset, stratified by subject or question type; both weights get the same questions.
-- `--think on` (or `off,on`) also evaluates with thinking, with at most 16,384 output tokens.
-- `--out`, `--data`, `--port` and `--concurrency` set where results and datasets go, the server port and the number of parallel requests. Extra server flags go in `SGLANG_ARGS` (default `--attention-backend triton`).
-
-If the SGLang scheduler fails at startup with `GLIBCXX_3.4.29 not found`, the system `libstdc++` is too old for SGLang's compiled radix-cache backend. Select its Python implementation instead: `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python bash scripts/benchmark.sh ...`.
-
-## 🚀 Decode Throughput
-
-`throughput/` measures batch-1 decode speed of a dense FP16 model and of the same model with SPHQuant W2 weights, whose decoder projections run the fused GEMV kernel in `cuda_kernel/`. Only the shapes matter for speed, so by default the model is [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B) built from its config (`throughput/configs/qwen3-8b.json`) with random weights and random W2 codes; nothing is downloaded:
-
-```bash
+# 3. Decode throughput: dense FP16 vs the W2 kernel (Qwen3-8B with random weights)
 bash scripts/throughput.sh
 ```
 
-The script builds the kernels for GPU 0's architecture and then:
-
-1. times every decoder projection on its own, dense against W2, with weights read from memory as in a real decode step (`outputs/throughput/gemv.json`);
-2. builds each model, checks every W2 module against its weight decoded in PyTorch, and times it with a 256-token random prompt and 512 generated tokens, using a static KV cache. The single-token forward is compiled with `torch.compile(fullgraph=True, mode="reduce-overhead")`, so each decode step replays a CUDA graph. In both models q/k/v and gate/up are fused into one projection each, and the attention of every decode step runs the split-KV kernel in `cuda_kernel/decode_attention.cu`; the prompt uses PyTorch's SDPA. With `--attention sdpa` the decode steps use SDPA as well, as transformers does by default; at batch 1 that is PyTorch's memory-efficient kernel, which uses one block per query head and leaves most SMs of a large GPU idle.
-
-Each model runs in its own process with untimed warmup, and the median of 5 windows is reported as decode tokens/s (single-token forwards after the prompt), end-to-end tokens/s (prompt plus greedy generation) and time to first token. A profile of 64 decode steps shows where the GPU time of a step goes (W2 GEMV, dense matmul, attention, fused elementwise kernels). Results go to `outputs/throughput/` (one JSON per model and `summary.md` with the W2 speedup). Options: `--attention kernel,sdpa`, `--modes compiled,eager`, `--prefill N`, `--decode N`, `--samples N`, `--dtype bfloat16`, `--config FILE` for another architecture; see `bash scripts/throughput.sh --help`. For comparison, `SPH_PDL=0` launches the W2 GEMV without programmatic dependent launch, and `SPH_GLU=0` computes silu(gate) * up after the fused gate/up GEMV instead of inside it.
-
-The packed W2 weights take 2.5 bits per weight (the 2.25 bits of codes plus an FP16 step and minimum per 128 weights). At load time they are rearranged into the layout the kernel reads, with the same size; prompts of more than 8 tokens multiply by the dequantized FP16 weight instead.
-
-## 📁 Repository Structure
-
-```
-sphquant/      calibration: COCO cache, spherical quantizer, layer-wise calibration, export, packing
-cuda_kernel/   fused W2 GEMV kernel (sph_gemv.cu), decode attention kernel, build script and PyTorch operators
-benchmark/     RealWorldQA, ScienceQA and TextVQA loaders, prompts and scoring, SGLang client, summaries
-throughput/    batch-1 decode throughput: random-weight models, per-projection and whole-model timings, summary
-scripts/       calibrate_w2.sh, benchmark.sh, throughput.sh
-```
+Results go to `outputs/eval/<dataset>/summary.md` and `outputs/throughput/summary.md`. Each script lists its options with `--help`.
 
 ## 🔖 To Do
 
